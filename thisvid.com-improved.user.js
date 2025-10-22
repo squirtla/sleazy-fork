@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ThisVid.com Improved
 // @namespace    http://tampermonkey.net/
-// @version      5.2.4
+// @version      6.0.3
 // @license      MIT
 // @description  Infinite scroll (optional). Preview for private videos. Filter: duration, public/private, include/exclude terms. Check access to private vids.  Mass friend request button. Sorts messages. Download button 📼
 // @author       smartacephale
@@ -9,8 +9,8 @@
 // @match        https://*.thisvid.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=thisvid.com
 // @grant        GM_addStyle
-// @require      https://cdn.jsdelivr.net/npm/billy-herrington-utils@1.3.6/dist/billy-herrington-utils.umd.js
-// @require      https://cdn.jsdelivr.net/npm/jabroni-outfit@1.4.9/dist/jabroni-outfit.umd.js
+// @require      https://cdn.jsdelivr.net/npm/billy-herrington-utils@1.4.2/dist/billy-herrington-utils.umd.js
+// @require      https://cdn.jsdelivr.net/npm/jabroni-outfit@1.6.5/dist/jabroni-outfit.umd.js
 // @require      https://cdn.jsdelivr.net/npm/lskdb@1.0.2/dist/lskdb.umd.js
 // @run-at       document-idle
 // @downloadURL https://update.sleazyfork.org/scripts/485716/ThisVidcom%20Improved.user.js
@@ -37,13 +37,15 @@ const {
   InfiniteScroller,
   createInfiniteScroller,
   DataManager,
+  objectToFormData
 } = window.bhutils;
 Object.assign(unsafeWindow, { bhutils: window.bhutils });
 const {
   JabroniOutfitStore,
-  defaultStateWithDurationAndPrivacy,
+  defaultStateWithDurationAndPrivacyAndHD,
   JabroniOutfitUI,
-  defaultSchemeWithPrivateFilter,
+  DefaultScheme,
+  defaultSchemeWithPrivacyFilterWithHDwithSort,
 } = window.jabronioutfit;
 const { LSKDB } = window.lskdb;
 
@@ -75,25 +77,25 @@ GM_addStyle(`
 class THISVID_RULES {
   delay = 350;
 
+  PAGINATION_ALLOWED = [
+    /\.com\/$/,
+    /\/(categories|tags?)\//,
+    /\/?q=.*/,
+    /\/(\w+-)?(rated|popular|private|newest|winners|updates)\/(\d+\/)?$/,
+    /\/members\/\d+\/\w+_videos\//,
+    /\/playlist\/\d+\//,
+    /\/my_(\w+)_videos\//,
+    /\/my_wall\/#\w+/,
+  ].some((r) => r.test(location.href));
+
+  IS_MEMBER_PAGE = /^\/members\/\d+\/$/.test(location.pathname);
+  IS_WATCHLATER_KIND = /^\/my_(\w+)_videos\//.test(location.pathname);
+  IS_MESSAGES_PAGE = /^\/my_messages\//.test(location.pathname);
+  IS_PLAYLIST = /^\/playlist\/\d+\//.test(location.pathname);
+  IS_VIDEO_PAGE = /^\/videos\//.test(location.pathname);
+
   constructor() {
-    const { href, pathname } = window.location;
-
-    this._PAGINATION_ALLOWED = [
-      /\.com\/$/,
-      /\/(categories|tags?)\//,
-      /\/?q=.*/,
-      /\/(\w+-)?(rated|popular|private|newest|winners|updates)\/(\d+\/)?$/,
-      /\/members\/\d+\/\w+_videos\//,
-      /\/playlist\/\d+\//,
-      /\/my_(\w+)_videos\//,
-      /\/my_wall\/#\w+/,
-    ].some((r) => r.test(href));
-
-    this.IS_MEMBER_PAGE = /^\/members\/\d+\/$/.test(pathname);
-    this.IS_WATCHLATER_KIND = /^\/my_(\w+)_videos\//.test(pathname);
-    this.IS_MESSAGES_PAGE = /^\/my_messages\//.test(pathname);
-    this.IS_PLAYLIST = /^\/playlist\/\d+\//.test(pathname);
-    this.IS_VIDEO_PAGE = /^\/videos\//.test(pathname);
+    const { pathname } = window.location;
 
     this.PAGE_HAS_VIDEO = this.GET_THUMBS(document).length > 0;
 
@@ -132,6 +134,8 @@ class THISVID_RULES {
     const e = doc || document;
     return parseInt(e.querySelector('.pagination-next')?.previousElementSibling?.innerText) || 1;
   }
+
+  IS_HD(e) { return !!!e.querySelector('.quality'); }
 
   GET_THUMBS(html) {
     if (this.IS_WATCHLATER_KIND) {
@@ -199,7 +203,8 @@ class THISVID_RULES {
   THUMB_DATA(thumb) {
     const title = sanitizeStr(thumb.querySelector('.title').innerText);
     const duration = timeToSeconds(thumb.querySelector('.thumb > .duration').textContent);
-    return { title, duration };
+    const view = Number(thumb.querySelector('.view').textContent);
+    return { title, duration, view };
   }
 
   IS_PRIVATE(thumb) {
@@ -215,25 +220,41 @@ function friend(id, message = '') {
   return fetchWith(FRIEND_REQUEST_URL(id, message));
 }
 
+function acceptFriendship(id) {
+  const body = objectToFormData({
+    action: "confirm_add_to_friends",
+    function: "get_block",
+    block_id: "member_profile_view_view_profile",
+    confirm: "",
+    format: "json",
+    mode: "async"
+  });
+  const url = `https://thisvid.com/members/${id}/`;
+  return fetch(url, { body, method: "post" });
+}
+
 const FRIEND_REQUEST_URL = (id, message = '') =>
   `https://thisvid.com/members/${id}/?action=add_to_friends_complete&function=get_block&block_id=member_profile_view_view_profile&format=json&mode=async&message=${message}`;
 
 const USERS_PER_PAGE = 24;
 
-async function getMemberFriends(memberId, start, end) {
+async function getMemberFriends(memberId, start, end, by) {
   const { friendsCount } = await getMemberData(memberId);
   const offset = Math.ceil(friendsCount / USERS_PER_PAGE);
-  const pages = range(offset)
-    .slice(start, end)
-    .map((o) => `https://thisvid.com/members/${memberId}/friends/${o}/`);
+
+  let friendsURL = `https://thisvid.com/members/${memberId}/friends/`;
+  if (by === 'activity') friendsURL = 'https://thisvid.com/my_friends_by_activity/';
+  if (by === 'popularity') friendsURL = 'https://thisvid.com/my_friends_by_popularity/';
+
+  const pages = range(offset).slice(start, end).map((o) => `${friendsURL}${o}/`);
   const pagesFetched = pages.map((p) => fetchHtml(p));
   const friends = (await Promise.all(pagesFetched)).flatMap(getMembers);
   return friends;
 }
 
 function getMembers(el) {
-  const friendsList = el.querySelector('#list_members_friends_items');
-  return Array.from(friendsList?.querySelectorAll('.tumbpu') || [])
+  const friendsList = el.querySelector('#list_members_friends_items') || el;
+  return Array.from(el?.querySelectorAll('.tumbpu') || [])
     .map((e) => e.href.match(/\d+/)?.[0])
     .filter((_) => _);
 }
@@ -301,16 +322,6 @@ function initFriendship() {
 
 //====================================================================================================
 
-async function sendMessage(uid, message = 'add me pls') {
-  const url = new URL(
-    `https://thisvid.com/members/${uid}/?action=send_message_complete&function=get_block&block_id=member_profile_view_view_profile&format=json&mode=async`,
-  );
-  url.searchParams.append('message', message);
-  await fetch(url.href);
-}
-
-//====================================================================================================
-
 async function getMemberData(id) {
   const url = id.includes('member') ? id : `/members/${id}/`;
   const doc = await fetchHtml(url);
@@ -339,6 +350,17 @@ async function getMemberData(id) {
 
 //====================================================================================================
 
+function requestAccessVideoPage() {
+  const holder = document.querySelector('.video-holder > p');
+  if (holder) {
+    const uploader = document.querySelector('a.author').href.match(/\d+/).at(-1);
+    const button = parseDom(
+      `<button onclick="requestPrivateAccess(event, ${uploader}); this.onclick=null;">Friend Request</button>`,
+    );
+    holder.parentElement.append(button);
+  }
+}
+
 unsafeWindow.requestPrivateAccess = (e, memberid) => {
   e.preventDefault();
   friend(memberid, '');
@@ -362,31 +384,33 @@ async function checkPrivateVideoAccess(url) {
   };
 }
 
-const uploadersNotInFriendlist = new Set();
+function getUncheckedPrivateThumbs(html = document) {
+  const thumbs = html.querySelectorAll('.tumbpu:has(.private):not(.haveNoAccess):not(haveAccess), .thumb-holder:has(.private):not(.haveNoAccess):not(haveAccess)');
+  return Array.from(thumbs);
+}
+
+const uploadersChecked = new Set();
 
 async function requestAccess() {
   const checkAccess = async (thumb) => {
-    const { access, uploaderURL } = await checkPrivateVideoAccess(thumb.href || thumb.querySelector('a').href);
+    const { access, uploaderURL } = await checkPrivateVideoAccess(RULES.THUMB_URL(thumb));
 
-    if (!access) {
-      thumb.classList.add('haveNoAccess');
-
-      if (!uploadersNotInFriendlist.has(uploaderURL)) friend(uploaderURL);
-    } else {
+    if (access) {
       thumb.classList.add('haveAccess');
+      return;
     }
-  };
+    thumb.classList.add('haveNoAccess');
 
-  const f = [];
-  document
-    .querySelectorAll('.tumbpu:has(.private), .thumb-holder:has(.private)')
-    .forEach((thumb) => {
-      if (!thumb.classList.contains('haveNoAccess') && !thumb.classList.contains('haveAccess')) {
-        f.push(() => checkAccess(thumb));
-      }
-    });
-  computeAsyncOneAtTime(f);
+    if (state.autoRequestAccess && !uploadersChecked.has(uploaderURL)) {
+      acceptFriendship(uploaderURL);
+      friend(uploaderURL);
+    }
+  }
+
+  computeAsyncOneAtTime(getUncheckedPrivateThumbs().map(t => (() => checkAccess(t))));
 }
+
+Object.assign(window, { requestAccess });
 
 //====================================================================================================
 
@@ -437,21 +461,6 @@ class PreviewAnimation {
 
 //====================================================================================================
 
-function highlightMessages() {
-  for (const member of document.querySelectorAll('.user-avatar > a')) {
-    getMemberData(member.href).then(({ uploadedPublic, uploadedPrivate }) => {
-      if (uploadedPrivate > 0) {
-        const success = !member.parentElement.nextElementSibling.innerText.includes('declined');
-        member.parentElement.parentElement.classList.add(success ? 'success' : 'failure');
-      }
-      member.parentElement.parentElement.querySelector('.user-comment p').innerText +=
-        `  |  videos: ${uploadedPublic} public, ${uploadedPrivate} private`;
-    });
-  }
-}
-
-//====================================================================================================
-
 const lskdb = new LSKDB();
 
 async function getMemberVideos(id, type = 'private') {
@@ -470,7 +479,7 @@ async function getMemberVideos(id, type = 'private') {
   return { name, videosCount, memberVideosGenerator };
 }
 
-async function getMembersVideos(id, friendsCount, memberGeneratorCallback, type = 'private') {
+async function getMembersVideos(id, friendsCount, memberGeneratorCallback, type = 'private', by) {
   let skipFlag = false;
   let skipCount = 1;
   let minVideosCount = 1;
@@ -483,8 +492,8 @@ async function getMembersVideos(id, friendsCount, memberGeneratorCallback, type 
     minVideosCount = n;
   };
 
-  let membersIds = await getMemberFriends(id, 0, 1);
-  getMemberFriends(id, 1).then((r) => {
+  let membersIds = await getMemberFriends(id, 0, 1, by);
+  getMemberFriends(id, 1, 100000, by).then((r) => {
     membersIds = membersIds.concat(r);
   });
 
@@ -530,24 +539,32 @@ async function getMembersVideos(id, friendsCount, memberGeneratorCallback, type 
 
 function createPrivateFeedButton() {
   const container = document.querySelectorAll('.sidebar ul')[1];
-  const buttonPrv = parseDom(
-    `<li><a href="https://thisvid.com/my_wall/#private_feed" class="selective"><i class="ico-arrow"></i>My Friends Private Videos</a></li>`,
-  );
-  const buttonPub = parseDom(
-    `<li><a href="https://thisvid.com/my_wall/#public_feed" class="selective"><i class="ico-arrow"></i>My Friends Public Videos</a></li>`,
-  );
-  container.append(buttonPub, buttonPrv);
+
+  const links = [
+    { hov: '#private_feed', text: 'My Private Feed' },
+    { hov: '#private_feed_popularity', text: 'My Private Feed by Popularity' },
+    { hov: '#private_feed_activity', text: 'My Private Feed by Activity' },
+    { hov: '#public_feed', text: 'My Public Feed' },
+    { hov: '#public_feed_popularity', text: 'My Public Feed by Popularity' },
+    { hov: '#public_feed_activity', text: 'My Public Feed by Activity' },
+  ];
+
+  links.forEach(({ hov, text }) => {
+    const button = parseDom(`<li><a href="https://thisvid.com/my_wall/${hov}" class="selective"><i class="ico-arrow"></i>${text}</a></li>`);
+    container.append(button);
+  });
 }
 
 async function createPrivateFeed() {
   createPrivateFeedButton();
   if (!window.location.hash.includes('feed')) return;
-  const isPubKey = window.location.hash === '#public_feed';
+  const isPubKey = window.location.hash.includes('public_feed') ? 'public' : 'private';
+  const sortByFeed = window.location.hash.includes('activity') ? 'activity' : (window.location.hash.includes('popularity') ? 'popularity' : undefined);
 
   const container = parseDom('<div class="thumbs-items"></div>');
   const ignored = parseDom('<div class="ignored"><h2>IGNORED:</h2></div>');
 
-  Object.assign(defaultSchemeWithPrivateFilter, {
+  Object.assign(defaultSchemeWithPrivacyFilterWithHDwithSort, {
     controlsSkip: [
       { type: 'button', innerText: 'skip 10', callback: async () => skip(10) },
       { type: 'button', innerText: 'skip 100', callback: async () => skip(100) },
@@ -565,7 +582,9 @@ async function createPrivateFeed() {
   containerParent.nextElementSibling.remove();
   containerParent.append(container);
   container.before(ignored);
-  GM_addStyle(`.content { width: auto; }
+
+  GM_addStyle(`
+   .content { width: auto; }
    .member-videos, .ignored { background: #b3b3b324; min-height: 3rem; margin: 1rem 0px; color: #fff; font-size: 1.24rem; display: flex; flex-wrap: wrap; justify-content: center;
      padding: 10px; width: 100%; }
    .member-videos * {  padding: 5px; margin: 4px; }
@@ -593,7 +612,8 @@ async function createPrivateFeed() {
        </div>`),
       );
     },
-    isPubKey ? 'public' : 'private',
+    isPubKey,
+    sortByFeed
   );
 
   RULES.alternativeGenerator = pageGenerator;
@@ -640,10 +660,23 @@ async function createPrivateFeed() {
 
   const filterVidsCount = (count) => filterVideosCount(count);
 
-  createInfiniteScroller(store, handleLoadedHTML, RULES);
+  createInfiniteScroller(store, parseData, RULES);
 }
 
 //====================================================================================================
+
+async function sendMessage(uid, message = 'add me pls') {
+  const url = new URL(
+    `https://thisvid.com/members/${uid}/?action=send_message_complete&function=get_block&block_id=member_profile_view_view_profile&format=json&mode=async`,
+  );
+  url.searchParams.append('message', message);
+  await fetch(url.href);
+}
+
+function deleteMsg(id) {
+  const url = `https://thisvid.com/my_messages/inbox/?mode=async&format=json&action=delete&function=get_block&block_id=list_messages_my_conversation_messages&delete[]=${id}`;
+  fetch(url).then((res) => console.log(url, res?.status));
+}
 
 async function clearMessages() {
   const sortMsgs = (doc) => {
@@ -652,11 +685,6 @@ async function clearMessages() {
       const msg = e.querySelector('.user-comment').innerText;
       if (/has confirmed|declined your|has removed/g.test(msg)) deleteMsg(id);
     });
-  };
-
-  const deleteMsg = (id) => {
-    const url = `https://thisvid.com/my_messages/inbox/?mode=async&format=json&action=delete&function=get_block&block_id=list_messages_my_conversation_messages&delete[]=${id}`;
-    fetch(url).then((res) => console.log(url, res?.status));
   };
 
   await Promise.all(
@@ -672,17 +700,26 @@ function clearMessagesButton() {
   document.querySelector('.headline').append(btn);
 }
 
+function highlightMessages() {
+  for (const member of document.querySelectorAll('.user-avatar > a')) {
+    getMemberData(member.href).then(({ uploadedPublic, uploadedPrivate }) => {
+      if (uploadedPrivate > 0) {
+        const success = !member.parentElement.nextElementSibling.innerText.includes('declined');
+        member.parentElement.parentElement.classList.add(success ? 'success' : 'failure');
+      }
+      member.parentElement.parentElement.querySelector('.user-comment p').innerText +=
+        `  |  videos: ${uploadedPublic} public, ${uploadedPrivate} private`;
+    });
+  }
+}
+
 //====================================================================================================
 
 function route() {
   console.log(SponsaaLogo);
 
-  if (RULES.LOGGED_IN) {
-    defaultSchemeWithPrivateFilter.privateFilter.push({
-      type: 'button',
-      innerText: 'request access 🔓',
-      callback: requestAccess,
-    });
+  if (!RULES.LOGGED_IN) {
+    delete defaultSchemeWithPrivacyFilterWithHDwithSort.privacyAccess
   }
 
   if (RULES.IS_MY_MEMBER_PAGE) {
@@ -696,15 +733,7 @@ function route() {
   }
 
   if (RULES.IS_VIDEO_PAGE) {
-    const holder = document.querySelector('.video-holder > p');
-    if (holder) {
-      const uploader = document.querySelector('a.author').href.match(/\d+/).at(-1);
-      holder.parentElement.append(
-        parseDom(
-          `<button onclick="requestPrivateAccess(event, ${uploader}); this.onclick=null;">Friend Request</button>`,
-        ),
-      );
-    }
+    requestAccessVideoPage();
     createDownloadButton();
   }
 
@@ -718,27 +747,27 @@ function route() {
 
   if (containers.length > 1 && !RULES.IS_MEMBER_PAGE) RULES.CONTAINER = containers[0];
   containers.forEach((c) => {
-    handleLoadedHTML(c, RULES.IS_MEMBER_PAGE ? c : RULES.CONTAINER, true);
+    parseData(c, RULES.IS_MEMBER_PAGE ? c : RULES.CONTAINER, true);
   });
 
   new PreviewAnimation(document.body);
-  new JabroniOutfitUI(store, defaultSchemeWithPrivateFilter);
+  new JabroniOutfitUI(store, defaultSchemeWithPrivacyFilterWithHDwithSort);
 
   if (RULES.IS_OTHER_MEMBER_PAGE) {
     initFriendship();
   }
 
-  if (RULES._PAGINATION_ALLOWED) {
+  if (RULES.PAGINATION_ALLOWED) {
     if (!RULES.paginationElement) return;
-    createInfiniteScroller(store, handleLoadedHTML, RULES);
+    createInfiniteScroller(store, parseData, RULES);
   }
 }
 
 //====================================================================================================
 
-const store = new JabroniOutfitStore(defaultStateWithDurationAndPrivacy);
-const { state, stateLocale } = store;
-const { applyFilters, handleLoadedHTML } = new DataManager(RULES, state);
+const store = new JabroniOutfitStore(defaultStateWithDurationAndPrivacyAndHD);
+const { state, localState } = store;
+const { applyFilters, parseData } = new DataManager(RULES, state);
 store.subscribe(applyFilters);
 
 route();

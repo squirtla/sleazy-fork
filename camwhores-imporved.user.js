@@ -1,26 +1,29 @@
 // ==UserScript==
 // @name         CamWhores.tv Improved
 // @namespace    http://tampermonkey.net/
-// @version      2.2.5
+// @version      2.4.4
 // @license      MIT
 // @description  Infinite scroll (optional). Filter by duration, private/public, include/exclude phrases. Mass friend request button. Download button
 // @author       smartacephale
 // @supportURL   https://github.com/smartacephale/sleazy-fork
 // @match        https://*.camwhores.*/*
-// @exclude      *.camwhores.tv/*mode=async*
+// @match        https://*.camwhores.tv/*
+// @exclude      https://*.camwhores.tv/*mode=async*
 // @grant        GM_addStyle
-// @require      https://cdn.jsdelivr.net/npm/billy-herrington-utils@1.3.6/dist/billy-herrington-utils.umd.js
-// @require      https://cdn.jsdelivr.net/npm/jabroni-outfit@1.4.9/dist/jabroni-outfit.umd.js
+// @require      https://cdn.jsdelivr.net/npm/billy-herrington-utils@1.4.3/dist/billy-herrington-utils.umd.js
+// @require      https://cdn.jsdelivr.net/npm/jabroni-outfit@1.6.5/dist/jabroni-outfit.umd.js
 // @require      https://cdn.jsdelivr.net/npm/lskdb@1.0.2/dist/lskdb.umd.js
 // @run-at       document-idle
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=camwhores.tv
+// @downloadURL https://update.sleazyfork.org/scripts/494528/CamWhorestv%20Improved.user.js
+// @updateURL https://update.sleazyfork.org/scripts/494528/CamWhorestv%20Improved.meta.js
 // ==/UserScript==
 /* globals $ */
 
 const { Tick, parseDom, fetchHtml, AsyncPool, wait, computeAsyncOneAtTime, timeToSeconds,
     circularShift, range, watchDomChangesWithThrottle, objectToFormData, parseDataParams, sanitizeStr,
     getAllUniqueParents, downloader, DataManager, createInfiniteScroller } = window.bhutils;
-const { JabroniOutfitStore, defaultStateWithDurationAndPrivacy, JabroniOutfitUI, defaultSchemeWithPrivateFilter } = window.jabronioutfit;
+const { JabroniOutfitStore, defaultStateWithDurationAndPrivacy, JabroniOutfitUI, defaultSchemeWithPrivacyFilter } = window.jabronioutfit;
 const { LSKDB } = window.lskdb;
 
 const LOGO = `camwhores admin should burn in hell
@@ -85,8 +88,7 @@ class CAMWHORES_RULES {
 
   CALC_CONTAINER = (document_ = document) => {
     const paginationEls = Array.from(document_.querySelectorAll('.pagination'));
-    let paginationElement = this.IS_MEMBER_PAGE || this.IS_MINE_MEMBER_PAGE ? undefined :
-      paginationEls?.[this.IS_SUBS && paginationEls.length > 1 ? 1 : 0];
+    const paginationElement = paginationEls?.[this.IS_SUBS && paginationEls.length > 1 ? 1 : 0];
 
     const paginationLast = Math.max(
       ...Array.from(paginationElement?.querySelectorAll('a[href][data-parameters]') || [], (v) =>
@@ -96,7 +98,8 @@ class CAMWHORES_RULES {
     const CONTAINER =
       paginationElement?.parentElement.querySelector('.list-videos>div>form') ||
       paginationElement?.parentElement.querySelector('.list-videos>div') ||
-      document.querySelector('.list-videos>div');
+      document.querySelector('.list-videos>div') ||
+      document_.querySelector('.playlist-holder, .list-playlists > div');
 
     return { paginationElement, paginationLast, CONTAINER };
   };
@@ -106,11 +109,7 @@ class CAMWHORES_RULES {
   }
 
   GET_THUMBS(html) {
-    return Array.from(
-      html.querySelectorAll('.list-videos .item') ||
-        html.querySelectorAll('.item') ||
-        html.children,
-    );
+    return Array.from(html.querySelectorAll('.list-videos .item, .playlist .item, .list-playlists > div > .item') || html.children);
   }
 
   THUMB_IMG_DATA(thumb) {
@@ -121,7 +120,7 @@ class CAMWHORES_RULES {
   }
 
   THUMB_URL(thumb) {
-    return thumb.firstElementChild.href;
+    return thumb.firstElementChild.href || thumb.href;
   }
 
   THUMB_DATA(thumb) {
@@ -170,7 +169,7 @@ function animate() {
     const tick = new Tick(ANIMATION_DELAY);
     $('img.thumb[data-cnt]').off()
     document.body.addEventListener('mouseover', (e) => {
-        if (!e.target.tagName === 'IMG' || !e.target.classList.contains('thumb') || !e.target.getAttribute('src')) return;
+        if (!e.target.tagName === 'IMG' || !e.target.classList.contains('thumb') || !e.target.getAttribute('src') || /data:image|avatar/.test(e.target.src)) return;
         const origin = e.target.src;
         if (origin.includes('avatar')) return;
         const count = parseInt(e.target.getAttribute('data-cnt')) || 5;
@@ -281,6 +280,8 @@ async function requestAccess() {
   setTimeout(processFriendship, FRIEND_REQUEST_INTERVAL);
 }
 
+Object.assign(window, { requestAccess });
+
 async function checkPrivateVidsAccess() {
     const checkAccess = async (item) => {
         const videoURL = item.firstElementChild.href;
@@ -291,8 +292,10 @@ async function checkPrivateVidsAccess() {
         const haveAccess = !doc.querySelector('.no-player');
 
         if (!haveAccess) {
-          const uid = doc.querySelector('.message a').href.match(/\d+/).at(-1);
-          lskdb.setKey(uid);
+          if (store.state.autoRequestAccess) {
+            const uid = doc.querySelector('.message a').href.match(/\d+/).at(-1);
+            lskdb.setKey(uid);
+          }
           item.classList.add('haveNoAccess');
         } else {
           item.classList.add('haveAccess');
@@ -346,8 +349,8 @@ function clearMessages() {
     }
     spool.run();
 
-    let c = 0;
     function checkMessageHistory(url) {
+        let c = 0;
         fetchHtml(url).then(html => {
             const hasFriendRequest = html.querySelector('input[value=confirm_add_to_friends]');
             const hasOriginalText = html.querySelector('.original-text')?.innerText;
@@ -371,32 +374,36 @@ function clearMessages() {
 
 //====================================================================================================
 
+function shoudIScroll() {
+  if (RULES.paginationElement && !RULES.IS_MEMBER_PAGE && !RULES.IS_MINE_MEMBER_PAGE) {
+    createInfiniteScroller(store, parseData, RULES);
+    shouldReload();
+  }
+}
+
 function route() {
   if (RULES.IS_LOGGED_IN) {
     setTimeout(processFriendship, 3000);
     if (RULES.IS_MEMBER_PAGE) {
       createFriendButton();
     }
-    if (RULES.HAS_VIDEOS) {
-      defaultSchemeWithPrivateFilter.privateFilter.push(
-        { type: 'button', innerText: 'check access 🔓', callback: requestAccess });
-    }
   }
 
-  if (RULES.paginationElement && !RULES.IS_MEMBER_PAGE && !RULES.IS_MINE_MEMBER_PAGE) {
-    createInfiniteScroller(store, handleLoadedHTML, RULES);
-    shouldReload();
+  if (!RULES.HAS_VIDEOS || !RULES.IS_LOGGED_IN) {
+    delete defaultSchemeWithPrivacyFilter.privacyFilter;
   }
+
+  shoudIScroll();
 
   if (RULES.HAS_VIDEOS) {
     watchDomChangesWithThrottle(
       document.querySelector('.content'),
       () => {
         const containers = getAllUniqueParents(RULES.GET_THUMBS(document.body));
-        containers.forEach((c) => handleLoadedHTML(c, c));
-        createInfiniteScroller(store, handleLoadedHTML, RULES);
+        containers.forEach((c) => parseData(c, c));
+        shoudIScroll();
       }, 1000, 1);
-    new JabroniOutfitUI(store, defaultSchemeWithPrivateFilter);
+    new JabroniOutfitUI(store, defaultSchemeWithPrivacyFilter);
     animate();
   }
 
@@ -420,8 +427,7 @@ const ANIMATION_DELAY = 500;
 const FRIEND_REQUEST_INTERVAL = 5000;
 
 const store = new JabroniOutfitStore(defaultStateWithDurationAndPrivacy);
-const { state, stateLocale } = store;
-const { applyFilters, handleLoadedHTML } = new DataManager(RULES, state);
+const { applyFilters, parseData } = new DataManager(RULES, store.state);
 store.subscribe(applyFilters);
 
 route();
